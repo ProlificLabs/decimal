@@ -9,7 +9,7 @@
 //
 // To use Decimal as part of a struct:
 //
-//	type Struct struct {
+//	type StructName struct {
 //	    Number Decimal
 //	}
 //
@@ -42,6 +42,20 @@ import (
 //	d4 := decimal.NewFromFloat(2).Div(decimal.NewFromFloat(3))
 //	d4.String() // output: "0.667"
 var DivisionPrecision = 16
+
+// PowPrecisionNegativeExponent specifies the maximum precision of the result (digits after decimal point)
+// when calculating decimal power. Only used for cases where the exponent is a negative number.
+// This constant applies to Pow, PowInt32 and PowBigInt methods, PowWithPrecision method is not constrained by it.
+//
+// Example:
+//
+//	d1, err := decimal.NewFromFloat(15.2).PowInt32(-2)
+//	d1.String() // output: "0.0043282548476454"
+//
+//	decimal.PowPrecisionNegativeExponent = 24
+//	d2, err := decimal.NewFromFloat(15.2).PowInt32(-2)
+//	d2.String() // output: "0.004328254847645429362881"
+var PowPrecisionNegativeExponent = 16
 
 // MarshalJSONWithoutQuotes should be set to true if you want the decimal to
 // be JSON marshaled as a number, instead of as a string.
@@ -100,7 +114,7 @@ func New(value int64, exp int32) Decimal {
 	}
 }
 
-// NewFromInt converts a int64 to Decimal.
+// NewFromInt converts an int64 to Decimal.
 //
 // Example:
 //
@@ -113,7 +127,7 @@ func NewFromInt(value int64) Decimal {
 	}
 }
 
-// NewFromInt32 converts a int32 to Decimal.
+// NewFromInt32 converts an int32 to Decimal.
 //
 // Example:
 //
@@ -126,12 +140,43 @@ func NewFromInt32(value int32) Decimal {
 	}
 }
 
+// NewFromUint64 converts an uint64 to Decimal.
+//
+// Example:
+//
+//	NewFromUint64(123).String() // output: "123"
+func NewFromUint64(value uint64) Decimal {
+	return Decimal{
+		value: new(big.Int).SetUint64(value),
+		exp:   0,
+	}
+}
+
 // NewFromBigInt returns a new Decimal from a big.Int, value * 10 ^ exp
 func NewFromBigInt(value *big.Int, exp int32) Decimal {
 	return Decimal{
 		value: new(big.Int).Set(value),
 		exp:   exp,
 	}
+}
+
+// NewFromBigRat returns a new Decimal from a big.Rat. The numerator and
+// denominator are divided and rounded to the given precision.
+//
+// Example:
+//
+//	d1 := NewFromBigRat(big.NewRat(0, 1), 0)    // output: "0"
+//	d2 := NewFromBigRat(big.NewRat(4, 5), 1)    // output: "0.8"
+//	d3 := NewFromBigRat(big.NewRat(1000, 3), 3) // output: "333.333"
+//	d4 := NewFromBigRat(big.NewRat(2, 7), 4)    // output: "0.2857"
+func NewFromBigRat(value *big.Rat, precision int32) Decimal {
+	return Decimal{
+		value: new(big.Int).Set(value.Num()),
+		exp:   0,
+	}.DivRound(Decimal{
+		value: new(big.Int).Set(value.Denom()),
+		exp:   0,
+	}, precision)
 }
 
 // NewFromString returns a new Decimal from a string representation.
@@ -237,7 +282,7 @@ func NewFromFormattedString(value string, replRegexp *regexp.Regexp) (Decimal, e
 }
 
 // RequireFromString returns a new Decimal from a string representation
-// or panics if NewFromString would have returned an error.
+// or panics if NewFromString had returned an error.
 //
 // Example:
 //
@@ -423,7 +468,7 @@ func NewFromFloatWithExponent(value float64, exp int32) Decimal {
 func (d Decimal) Copy() Decimal {
 	d.ensureInitialized()
 	return Decimal{
-		value: &(*d.value),
+		value: new(big.Int).Set(d.value),
 		exp:   d.exp,
 	}
 }
@@ -571,7 +616,7 @@ func (d Decimal) QuoRem(d2 Decimal, precision int32) (Decimal, Decimal) {
 		panic("decimal division by 0")
 	}
 	scale := -precision
-	e := int64(d.exp - d2.exp - scale)
+	e := int64(d.exp) - int64(d2.exp) - int64(scale)
 	if e > math.MaxInt32 || e < math.MinInt32 {
 		panic("overflow in decimal QuoRem")
 	}
@@ -636,24 +681,278 @@ func (d Decimal) DivRound(d2 Decimal, precision int32) Decimal {
 
 // Mod returns d % d2.
 func (d Decimal) Mod(d2 Decimal) Decimal {
-	quo := d.DivRound(d2, -d.exp+1).Truncate(0)
-	return d.Sub(d2.Mul(quo))
+	_, r := d.QuoRem(d2, 0)
+	return r
 }
 
-// Pow returns d to the power d2
+// Pow returns d to the power of d2.
+// When exponent is negative the returned decimal will have maximum precision of PowPrecisionNegativeExponent places after decimal point.
+//
+// Pow returns 0 (zero-value of Decimal) instead of error for power operation edge cases, to handle those edge cases use PowWithPrecision
+// Edge cases not handled by Pow:
+//   - 0 ** 0 => undefined value
+//   - 0 ** y, where y < 0 => infinity
+//   - x ** y, where x < 0 and y is non-integer decimal => imaginary value
+//
+// Example:
+//
+//	d1 := decimal.NewFromFloat(4.0)
+//	d2 := decimal.NewFromFloat(4.0)
+//	res1 := d1.Pow(d2)
+//	res1.String() // output: "256"
+//
+//	d3 := decimal.NewFromFloat(5.0)
+//	d4 := decimal.NewFromFloat(5.73)
+//	res2 := d3.Pow(d4)
+//	res2.String() // output: "10118.08037125"
 func (d Decimal) Pow(d2 Decimal) Decimal {
-	var temp Decimal
-	if d2.IntPart() == 0 {
-		return NewFromFloat(1)
+	baseSign := d.Sign()
+	expSign := d2.Sign()
+
+	if baseSign == 0 {
+		if expSign == 0 {
+			return Decimal{}
+		}
+		if expSign == 1 {
+			return Decimal{zeroInt, 0}
+		}
+		if expSign == -1 {
+			return Decimal{}
+		}
 	}
-	temp = d.Pow(d2.Div(NewFromFloat(2)))
-	if d2.IntPart()%2 == 0 {
-		return temp.Mul(temp)
+
+	if expSign == 0 {
+		return Decimal{oneInt, 0}
 	}
-	if d2.IntPart() > 0 {
-		return temp.Mul(temp).Mul(d)
+
+	// TODO: optimize extraction of fractional part
+	one := Decimal{oneInt, 0}
+	expIntPart, expFracPart := d2.QuoRem(one, 0)
+
+	if baseSign == -1 && !expFracPart.IsZero() {
+		return Decimal{}
 	}
-	return temp.Mul(temp).Div(d)
+
+	intPartPow, _ := d.PowBigInt(expIntPart.value)
+
+	// if exponent is an integer we don't need to calculate d1**frac(d2)
+	if expFracPart.value.Sign() == 0 {
+		return intPartPow
+	}
+
+	// TODO: optimize NumDigits for more performant precision adjustment
+	digitsBase := d.NumDigits()
+	digitsExponent := d2.NumDigits()
+
+	precision := digitsBase
+
+	if digitsExponent > precision {
+		precision += digitsExponent
+	}
+
+	precision += 6
+
+	// Calculate x ** frac(y), where
+	// x ** frac(y) = exp(ln(x ** frac(y)) = exp(ln(x) * frac(y))
+	fracPartPow, err := d.Abs().Ln(-d.exp + int32(precision))
+	if err != nil {
+		return Decimal{}
+	}
+
+	fracPartPow = fracPartPow.Mul(expFracPart)
+
+	fracPartPow, err = fracPartPow.ExpTaylor(-d.exp + int32(precision))
+	if err != nil {
+		return Decimal{}
+	}
+
+	// Join integer and fractional part,
+	// base ** (expBase + expFrac) = base ** expBase * base ** expFrac
+	res := intPartPow.Mul(fracPartPow)
+
+	return res
+}
+
+// PowWithPrecision returns d to the power of d2.
+// Precision parameter specifies minimum precision of the result (digits after decimal point).
+// Returned decimal is not rounded to 'precision' places after decimal point.
+//
+// PowWithPrecision returns error when:
+//   - 0 ** 0 => undefined value
+//   - 0 ** y, where y < 0 => infinity
+//   - x ** y, where x < 0 and y is non-integer decimal => imaginary value
+//
+// Example:
+//
+//	d1 := decimal.NewFromFloat(4.0)
+//	d2 := decimal.NewFromFloat(4.0)
+//	res1, err := d1.PowWithPrecision(d2, 2)
+//	res1.String() // output: "256"
+//
+//	d3 := decimal.NewFromFloat(5.0)
+//	d4 := decimal.NewFromFloat(5.73)
+//	res2, err := d3.PowWithPrecision(d4, 5)
+//	res2.String() // output: "10118.080371595015625"
+//
+//	d5 := decimal.NewFromFloat(-3.0)
+//	d6 := decimal.NewFromFloat(-6.0)
+//	res3, err := d5.PowWithPrecision(d6, 10)
+//	res3.String() // output: "0.0013717421"
+func (d Decimal) PowWithPrecision(d2 Decimal, precision int32) (Decimal, error) {
+	baseSign := d.Sign()
+	expSign := d2.Sign()
+
+	if baseSign == 0 {
+		if expSign == 0 {
+			return Decimal{}, fmt.Errorf("cannot represent undefined value of 0**0")
+		}
+		if expSign == 1 {
+			return Decimal{zeroInt, 0}, nil
+		}
+		if expSign == -1 {
+			return Decimal{}, fmt.Errorf("cannot represent infinity value of 0 ** y, where y < 0")
+		}
+	}
+
+	if expSign == 0 {
+		return Decimal{oneInt, 0}, nil
+	}
+
+	// TODO: optimize extraction of fractional part
+	one := Decimal{oneInt, 0}
+	expIntPart, expFracPart := d2.QuoRem(one, 0)
+
+	if baseSign == -1 && !expFracPart.IsZero() {
+		return Decimal{}, fmt.Errorf("cannot represent imaginary value of x ** y, where x < 0 and y is non-integer decimal")
+	}
+
+	intPartPow, _ := d.powBigIntWithPrecision(expIntPart.value, precision)
+
+	// if exponent is an integer we don't need to calculate d1**frac(d2)
+	if expFracPart.value.Sign() == 0 {
+		return intPartPow, nil
+	}
+
+	// TODO: optimize NumDigits for more performant precision adjustment
+	digitsBase := d.NumDigits()
+	digitsExponent := d2.NumDigits()
+
+	if int32(digitsBase) > precision {
+		precision = int32(digitsBase)
+	}
+	if int32(digitsExponent) > precision {
+		precision += int32(digitsExponent)
+	}
+	// increase precision by 10 to compensate for errors in further calculations
+	precision += 10
+
+	// Calculate x ** frac(y), where
+	// x ** frac(y) = exp(ln(x ** frac(y)) = exp(ln(x) * frac(y))
+	fracPartPow, err := d.Abs().Ln(precision)
+	if err != nil {
+		return Decimal{}, err
+	}
+
+	fracPartPow = fracPartPow.Mul(expFracPart)
+
+	fracPartPow, err = fracPartPow.ExpTaylor(precision)
+	if err != nil {
+		return Decimal{}, err
+	}
+
+	// Join integer and fractional part,
+	// base ** (expBase + expFrac) = base ** expBase * base ** expFrac
+	res := intPartPow.Mul(fracPartPow)
+
+	return res, nil
+}
+
+// PowInt32 returns d to the power of exp, where exp is int32.
+// Only returns error when d and exp is 0, thus result is undefined.
+//
+// When exponent is negative the returned decimal will have maximum precision of PowPrecisionNegativeExponent places after decimal point.
+//
+// Example:
+//
+//	d1, err := decimal.NewFromFloat(4.0).PowInt32(4)
+//	d1.String() // output: "256"
+//
+//	d2, err := decimal.NewFromFloat(3.13).PowInt32(5)
+//	d2.String() // output: "300.4150512793"
+func (d Decimal) PowInt32(exp int32) (Decimal, error) {
+	if d.IsZero() && exp == 0 {
+		return Decimal{}, fmt.Errorf("cannot represent undefined value of 0**0")
+	}
+
+	isExpNeg := exp < 0
+	exp = abs(exp)
+
+	n, result := d, New(1, 0)
+
+	for exp > 0 {
+		if exp%2 == 1 {
+			result = result.Mul(n)
+		}
+		exp /= 2
+
+		if exp > 0 {
+			n = n.Mul(n)
+		}
+	}
+
+	if isExpNeg {
+		return New(1, 0).DivRound(result, int32(PowPrecisionNegativeExponent)), nil
+	}
+
+	return result, nil
+}
+
+// PowBigInt returns d to the power of exp, where exp is big.Int.
+// Only returns error when d and exp is 0, thus result is undefined.
+//
+// When exponent is negative the returned decimal will have maximum precision of PowPrecisionNegativeExponent places after decimal point.
+//
+// Example:
+//
+//	d1, err := decimal.NewFromFloat(3.0).PowBigInt(big.NewInt(3))
+//	d1.String() // output: "27"
+//
+//	d2, err := decimal.NewFromFloat(629.25).PowBigInt(big.NewInt(5))
+//	d2.String() // output: "98654323103449.5673828125"
+func (d Decimal) PowBigInt(exp *big.Int) (Decimal, error) {
+	return d.powBigIntWithPrecision(exp, int32(PowPrecisionNegativeExponent))
+}
+
+func (d Decimal) powBigIntWithPrecision(exp *big.Int, precision int32) (Decimal, error) {
+	if d.IsZero() && exp.Sign() == 0 {
+		return Decimal{}, fmt.Errorf("cannot represent undefined value of 0**0")
+	}
+
+	tmpExp := new(big.Int).Set(exp)
+	isExpNeg := exp.Sign() < 0
+
+	if isExpNeg {
+		tmpExp.Abs(tmpExp)
+	}
+
+	n, result := d, New(1, 0)
+
+	for tmpExp.Sign() > 0 {
+		if tmpExp.Bit(0) == 1 {
+			result = result.Mul(n)
+		}
+		tmpExp.Rsh(tmpExp, 1)
+
+		if tmpExp.Sign() > 0 {
+			n = n.Mul(n)
+		}
+	}
+
+	if isExpNeg {
+		return New(1, 0).DivRound(result, precision), nil
+	}
+
+	return result, nil
 }
 
 // ExpHullAbrham calculates the natural exponent of decimal (e to the power of d) using Hull-Abraham algorithm.
@@ -818,14 +1117,162 @@ func (d Decimal) ExpTaylor(precision int32) (Decimal, error) {
 	return result, nil
 }
 
-// NumDigits returns the number of digits of the decimal coefficient (d.Value)
-// Note: Current implementation is extremely slow for large decimals and/or decimals with large fractional part
-func (d Decimal) NumDigits() int {
-	// Note(mwoss): It can be optimized, unnecessary cast of big.Int to string
+// Ln calculates natural logarithm of d.
+// Precision argument specifies how precise the result must be (number of digits after decimal point).
+// Negative precision is allowed.
+//
+// Example:
+//
+//	d1, err := NewFromFloat(13.3).Ln(2)
+//	d1.String()  // output: "2.59"
+//
+//	d2, err := NewFromFloat(579.161).Ln(10)
+//	d2.String()  // output: "6.3615805046"
+func (d Decimal) Ln(precision int32) (Decimal, error) {
+	// Algorithm based on The Use of Iteration Methods for Approximating the Natural Logarithm,
+	// James F. Epperson, The American Mathematical Monthly, Vol. 96, No. 9, November 1989, pp. 831-835.
 	if d.IsNegative() {
-		return len(d.value.String()) - 1
+		return Decimal{}, fmt.Errorf("cannot calculate natural logarithm for negative decimals")
 	}
-	return len(d.value.String())
+
+	if d.IsZero() {
+		return Decimal{}, fmt.Errorf("cannot represent natural logarithm of 0, result: -infinity")
+	}
+
+	calcPrecision := precision + 2
+	z := d.Copy()
+
+	var comp1, comp3, comp2, comp4, reduceAdjust Decimal
+	comp1 = z.Sub(Decimal{oneInt, 0})
+	comp3 = Decimal{oneInt, -1}
+
+	// for decimal in range [0.9, 1.1] where ln(d) is close to 0
+	usePowerSeries := false
+
+	if comp1.Abs().Cmp(comp3) <= 0 {
+		usePowerSeries = true
+	} else {
+		// reduce input decimal to range [0.1, 1)
+		expDelta := int32(z.NumDigits()) + z.exp
+		z.exp -= expDelta
+
+		// Input decimal was reduced by factor of 10^expDelta, thus we will need to add
+		// ln(10^expDelta) = expDelta * ln(10)
+		// to the result to compensate that
+		ln10 := ln10.withPrecision(calcPrecision)
+		reduceAdjust = NewFromInt32(expDelta)
+		reduceAdjust = reduceAdjust.Mul(ln10)
+
+		comp1 = z.Sub(Decimal{oneInt, 0})
+
+		if comp1.Abs().Cmp(comp3) <= 0 {
+			usePowerSeries = true
+		} else {
+			// initial estimate using floats
+			zFloat := z.InexactFloat64()
+			comp1 = NewFromFloat(math.Log(zFloat))
+		}
+	}
+
+	epsilon := Decimal{oneInt, -calcPrecision}
+
+	if usePowerSeries {
+		// Power Series - https://en.wikipedia.org/wiki/Logarithm#Power_series
+		// Calculating n-th term of formula: ln(z+1) = 2 sum [ 1 / (2n+1) * (z / (z+2))^(2n+1) ]
+		// until the difference between current and next term is smaller than epsilon.
+		// Coverage quite fast for decimals close to 1.0
+
+		// z + 2
+		comp2 = comp1.Add(Decimal{twoInt, 0})
+		// z / (z + 2)
+		comp3 = comp1.DivRound(comp2, calcPrecision)
+		// 2 * (z / (z + 2))
+		comp1 = comp3.Add(comp3)
+		comp2 = comp1.Copy()
+
+		for n := 1; ; n++ {
+			// 2 * (z / (z+2))^(2n+1)
+			comp2 = comp2.Mul(comp3).Mul(comp3)
+
+			// 1 / (2n+1) * 2 * (z / (z+2))^(2n+1)
+			comp4 = NewFromInt(int64(2*n + 1))
+			comp4 = comp2.DivRound(comp4, calcPrecision)
+
+			// comp1 = 2 sum [ 1 / (2n+1) * (z / (z+2))^(2n+1) ]
+			comp1 = comp1.Add(comp4)
+
+			if comp4.Abs().Cmp(epsilon) <= 0 {
+				break
+			}
+		}
+	} else {
+		// Halley's Iteration.
+		// Calculating n-th term of formula: a_(n+1) = a_n - 2 * (exp(a_n) - z) / (exp(a_n) + z),
+		// until the difference between current and next term is smaller than epsilon
+		var prevStep Decimal
+		maxIters := calcPrecision*2 + 10
+
+		for i := int32(0); i < maxIters; i++ {
+			// exp(a_n)
+			comp3, _ = comp1.ExpTaylor(calcPrecision)
+			// exp(a_n) - z
+			comp2 = comp3.Sub(z)
+			// 2 * (exp(a_n) - z)
+			comp2 = comp2.Add(comp2)
+			// exp(a_n) + z
+			comp4 = comp3.Add(z)
+			// 2 * (exp(a_n) - z) / (exp(a_n) + z)
+			comp3 = comp2.DivRound(comp4, calcPrecision)
+			// comp1 = a_(n+1) = a_n - 2 * (exp(a_n) - z) / (exp(a_n) + z)
+			comp1 = comp1.Sub(comp3)
+
+			if prevStep.Add(comp3).IsZero() {
+				// If iteration steps oscillate we should return early and prevent an infinity loop
+				// NOTE(mwoss): This should be quite a rare case, returning error is not necessary
+				break
+			}
+
+			if comp3.Abs().Cmp(epsilon) <= 0 {
+				break
+			}
+
+			prevStep = comp3
+		}
+	}
+
+	comp1 = comp1.Add(reduceAdjust)
+
+	return comp1.Round(precision), nil
+}
+
+// NumDigits returns the number of digits of the decimal coefficient (d.Value)
+func (d Decimal) NumDigits() int {
+	if d.value == nil {
+		return 1
+	}
+
+	if d.value.IsInt64() {
+		i64 := d.value.Int64()
+		// restrict fast path to integers with exact conversion to float64
+		if i64 <= (1<<53) && i64 >= -(1<<53) {
+			if i64 == 0 {
+				return 1
+			}
+			return int(math.Log10(math.Abs(float64(i64)))) + 1
+		}
+	}
+
+	estimatedNumDigits := int(float64(d.value.BitLen()) / math.Log2(10))
+
+	// estimatedNumDigits (lg10) may be off by 1, need to verify
+	digitsBigInt := big.NewInt(int64(estimatedNumDigits))
+	errorCorrectionUnit := digitsBigInt.Exp(tenInt, digitsBigInt, nil)
+
+	if d.value.CmpAbs(errorCorrectionUnit) >= 0 {
+		return estimatedNumDigits + 1
+	}
+
+	return estimatedNumDigits
 }
 
 // IsInteger returns true when decimal can be represented as an integer value, otherwise, it returns false.
@@ -873,12 +1320,21 @@ func (d Decimal) Cmp(d2 Decimal) int {
 	return rd.value.Cmp(rd2.value)
 }
 
+// Compare compares the numbers represented by d and d2 and returns:
+//
+//	-1 if d <  d2
+//	 0 if d == d2
+//	+1 if d >  d2
+func (d Decimal) Compare(d2 Decimal) int {
+	return d.Cmp(d2)
+}
+
 // Equal returns whether the numbers represented by d and d2 are equal.
 func (d Decimal) Equal(d2 Decimal) bool {
 	return d.Cmp(d2) == 0
 }
 
-// Equals is deprecated, please use Equal method instead
+// Deprecated: Equals is deprecated, please use Equal method instead.
 func (d Decimal) Equals(d2 Decimal) bool {
 	return d.Equal(d2)
 }
@@ -972,9 +1428,7 @@ func (d Decimal) IntPart() int64 {
 // BigInt returns integer component of the decimal as a BigInt.
 func (d Decimal) BigInt() *big.Int {
 	scaledD := d.rescale(0)
-	i := &big.Int{}
-	i.SetString(scaledD.String(), 10)
-	return i
+	return scaledD.value
 }
 
 // BigFloat returns decimal as BigFloat.
@@ -1113,7 +1567,7 @@ func (d Decimal) Round(places int32) Decimal {
 //	NewFromFloat(545).RoundCeil(-2).String()   // output: "600"
 //	NewFromFloat(500).RoundCeil(-2).String()   // output: "500"
 //	NewFromFloat(1.1001).RoundCeil(2).String() // output: "1.11"
-//	NewFromFloat(-1.454).RoundCeil(1).String() // output: "-1.5"
+//	NewFromFloat(-1.454).RoundCeil(1).String() // output: "-1.4"
 func (d Decimal) RoundCeil(places int32) Decimal {
 	if d.exp >= -places {
 		return d
@@ -1138,7 +1592,7 @@ func (d Decimal) RoundCeil(places int32) Decimal {
 //	NewFromFloat(545).RoundFloor(-2).String()   // output: "500"
 //	NewFromFloat(-500).RoundFloor(-2).String()   // output: "-500"
 //	NewFromFloat(1.1001).RoundFloor(2).String() // output: "1.1"
-//	NewFromFloat(-1.454).RoundFloor(1).String() // output: "-1.4"
+//	NewFromFloat(-1.454).RoundFloor(1).String() // output: "-1.5"
 func (d Decimal) RoundFloor(places int32) Decimal {
 	if d.exp >= -places {
 		return d
@@ -1163,7 +1617,7 @@ func (d Decimal) RoundFloor(places int32) Decimal {
 //	NewFromFloat(545).RoundUp(-2).String()   // output: "600"
 //	NewFromFloat(500).RoundUp(-2).String()   // output: "500"
 //	NewFromFloat(1.1001).RoundUp(2).String() // output: "1.11"
-//	NewFromFloat(-1.454).RoundUp(1).String() // output: "-1.4"
+//	NewFromFloat(-1.454).RoundUp(1).String() // output: "-1.5"
 func (d Decimal) RoundUp(places int32) Decimal {
 	if d.exp >= -places {
 		return d
@@ -1190,7 +1644,7 @@ func (d Decimal) RoundUp(places int32) Decimal {
 //	NewFromFloat(545).RoundDown(-2).String()   // output: "500"
 //	NewFromFloat(-500).RoundDown(-2).String()   // output: "-500"
 //	NewFromFloat(1.1001).RoundDown(2).String() // output: "1.1"
-//	NewFromFloat(-1.454).RoundDown(1).String() // output: "-1.5"
+//	NewFromFloat(-1.454).RoundDown(1).String() // output: "-1.4"
 func (d Decimal) RoundDown(places int32) Decimal {
 	if d.exp >= -places {
 		return d
@@ -1374,19 +1828,18 @@ func (d *Decimal) UnmarshalBinary(data []byte) error {
 
 // MarshalBinary implements the encoding.BinaryMarshaler interface.
 func (d Decimal) MarshalBinary() (data []byte, err error) {
-	// Write the exponent first since it's a fixed size
-	v1 := make([]byte, 4)
-	binary.BigEndian.PutUint32(v1, uint32(d.exp))
-
-	// Add the value
-	var v2 []byte
-	if v2, err = d.value.GobEncode(); err != nil {
-		return
+	// exp is written first, but encode value first to know output size
+	var valueData []byte
+	if valueData, err = d.value.GobEncode(); err != nil {
+		return nil, err
 	}
 
+	// Write the exponent in front, since it's a fixed size
+	expData := make([]byte, 4, len(valueData)+4)
+	binary.BigEndian.PutUint32(expData, uint32(d.exp))
+
 	// Return the byte array
-	data = append(v1, v2...)
-	return
+	return append(expData, valueData...), nil
 }
 
 // Scan implements the sql.Scanner interface for database deserialization.
@@ -1407,6 +1860,11 @@ func (d *Decimal) Scan(value interface{}) error {
 		// at least in sqlite3 when the value is 0 in db, the data is sent
 		// to us as an int64 instead of a float64 ...
 		*d = New(v, 0)
+		return nil
+
+	case uint64:
+		// while clickhouse may send 0 in db as uint64
+		*d = NewFromUint64(v)
 		return nil
 
 	default:
@@ -1456,7 +1914,8 @@ func (d *Decimal) GobDecode(data []byte) error {
 }
 
 // StringScaled first scales the decimal then calls .String() on it.
-// NOTE: buggy, unintuitive, and DEPRECATED! Use StringFixed instead.
+//
+// Deprecated: buggy and unintuitive. Use StringFixed instead.
 func (d Decimal) StringScaled(exp int32) string {
 	return d.rescale(exp).String()
 }
@@ -1568,22 +2027,13 @@ func RescalePair(d1 Decimal, d2 Decimal) (Decimal, Decimal) {
 	d1.ensureInitialized()
 	d2.ensureInitialized()
 
-	if d1.exp == d2.exp {
-		return d1, d2
+	if d1.exp < d2.exp {
+		return d1, d2.rescale(d1.exp)
+	} else if d1.exp > d2.exp {
+		return d1.rescale(d2.exp), d2
 	}
 
-	baseScale := min(d1.exp, d2.exp)
-	if baseScale != d1.exp {
-		return d1.rescale(baseScale), d2
-	}
-	return d1, d2.rescale(baseScale)
-}
-
-func min(x, y int32) int32 {
-	if x >= y {
-		return y
-	}
-	return x
+	return d1, d2
 }
 
 func unquoteIfQuoted(value interface{}) (string, error) {
@@ -1595,8 +2045,7 @@ func unquoteIfQuoted(value interface{}) (string, error) {
 	case []byte:
 		bytes = v
 	default:
-		return "", fmt.Errorf("could not convert value '%+v' to byte array of type '%T'",
-			value, value)
+		return "", fmt.Errorf("could not convert value '%+v' to byte array of type '%T'", value, value)
 	}
 
 	// If the amount is quoted, strip the quotes
