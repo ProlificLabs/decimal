@@ -2143,6 +2143,14 @@ func TestDecimal_Mod(t *testing.T) {
 		Inp{"-7.5", "2"}:                        "-1.5",
 		Inp{"7.5", "-2"}:                        "1.5",
 		Inp{"-7.5", "-2"}:                       "-1.5",
+		// BUG: this case currently fails.
+		// Mathematically, 1 = 2 * 0.333333334 + 0.333333332, so 1 mod 0.333333334
+		// should be 0.333333332. However, Mod uses DivRound (round-half-away-from-zero)
+		// instead of a floor/truncate to compute the quotient: 1 / 0.333333334 =
+		// 2.999999994 rounds up to 3, and 1 - 3 * 0.333333334 = -0.000000002.
+		// The result is both wrong in magnitude and wrong in sign (a true modulo of
+		// two positive operands should never be negative).
+		Inp{"1", "0.333333334"}: "0.333333332",
 	}
 
 	for inp, res := range inputs {
@@ -2157,6 +2165,59 @@ func TestDecimal_Mod(t *testing.T) {
 		c := a.Mod(b)
 		if c.String() != res {
 			t.Errorf("expected %s, got %s", res, c.String())
+		}
+	}
+}
+
+// TestDecimal_Mod_ProposedFix demonstrates that switching Mod's implementation
+// to `_, r := d.QuoRem(d2, 0); return r` produces the mathematically correct
+// result for the `1 mod 0.333333334` case that the current Mod gets wrong.
+//
+// The current implementation:
+//
+//	quo := d.DivRound(d2, -d.exp+1).Truncate(0)
+//	return d.Sub(d2.Mul(quo))
+//
+// uses round-half-away-from-zero for the quotient, so 1 / 0.333333334 =
+// 2.999999994 rounds up to 3, giving 1 - 3*0.333333334 = -0.000000002.
+//
+// QuoRem(d2, 0) computes a truncated integer quotient instead (matching Go's
+// `%` semantics: the remainder has the same sign as the dividend and
+// 0 <= |r| < |d2|), so 1 / 0.333333334 truncates to 2, giving the correct
+// remainder 0.333333332.
+//
+// This test does NOT modify Mod — it runs the proposed body inline so the
+// team can see the fix works without committing it.
+func TestDecimal_Mod_ProposedFix(t *testing.T) {
+	proposedMod := func(d, d2 Decimal) Decimal {
+		_, r := d.QuoRem(d2, 0)
+		return r
+	}
+
+	a, _ := NewFromString("1")
+	b, _ := NewFromString("0.333333334")
+
+	got := proposedMod(a, b).String()
+	const want = "0.333333332"
+	if got != want {
+		t.Errorf("proposed Mod: expected %s, got %s", want, got)
+	}
+
+	// Sanity-check that the proposed implementation still agrees with the
+	// existing Mod on the cases the existing Mod gets right.
+	for _, tc := range []struct{ a, b, want string }{
+		{"3", "2", "1"},
+		{"9999999999", "1275", "324"},
+		{"0.1", "0.1", "0"},
+		{"0", "1.001", "0"},
+		{"-7.5", "2", "-1.5"},
+		{"7.5", "-2", "1.5"},
+		{"-7.5", "-2", "-1.5"},
+	} {
+		x, _ := NewFromString(tc.a)
+		y, _ := NewFromString(tc.b)
+		if got := proposedMod(x, y).String(); got != tc.want {
+			t.Errorf("proposed Mod(%s, %s): expected %s, got %s", tc.a, tc.b, tc.want, got)
 		}
 	}
 }
